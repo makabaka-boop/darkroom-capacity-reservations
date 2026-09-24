@@ -61,10 +61,10 @@ test('新建批次 → 分次登记 → 恰好耗尽 → 刷新后还原同一�
   await expect(page.getByTestId('usage-remaining').first()).toHaveText('6');
   await expect(page.getByTestId('usage-time').first()).not.toBeEmpty();
 
-  // 超过剩余容量：就地说明原因，不写入记录
+  // 超过可用容量：就地说明原因，不写入记录
   await page.getByTestId('films-input').fill('7');
   await page.getByTestId('record-usage-button').click();
-  await expect(page.getByTestId('error-films')).toHaveText('超过剩余容量：本批仅剩 6，无法登记 7');
+  await expect(page.getByTestId('error-films')).toHaveText('超过可用容量：本批当前可用 6，无法登记 7');
   await expect(page.getByTestId('usage-item')).toHaveCount(1);
   await expect(page.getByTestId('detail-remaining')).toHaveText('6');
 
@@ -89,7 +89,7 @@ test('新建批次 → 分次登记 → 恰好耗尽 → 刷新后还原同一�
   // 已耗尽后继续登记仍被拒绝，且不写入
   await page.getByTestId('films-input').fill('1');
   await page.getByTestId('record-usage-button').click();
-  await expect(page.getByTestId('error-films')).toHaveText('超过剩余容量：本批仅剩 0，无法登记 1');
+  await expect(page.getByTestId('error-films')).toHaveText('超过可用容量：本批当前可用 0，无法登记 1');
   await expect(page.getByTestId('usage-item')).toHaveCount(2);
 
   // 刷新：还原同一台账（批次、状态、累计/剩余、使用记录）

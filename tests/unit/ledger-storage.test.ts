@@ -5,6 +5,9 @@ import {
   EMPTY_LEDGER,
   recordUsage,
   remainingCapacity,
+  reserveCapacity,
+  reservedCapacity,
+  usedCapacity,
   type LedgerDeps,
   type LedgerState,
 } from '../../src/lib/capacityLedger';
@@ -122,8 +125,66 @@ describe('容量台账持久化', () => {
     }
   });
 
-  it('待写入状态无法往返校验时拒绝写入，存储中的原有台账原样保留', () => {
+  it('旧存档缺少 reservations 字段时按空集合恢复，批次与记录结构含义不变', () => {
+    const legacy = JSON.stringify({
+      batches: [{ id: 'b1', name: '旧批次', capacity: 10, createdAt: 't' }],
+      records: [
+        { id: 'r1', batchId: 'b1', films: 3, note: '', remainingAfter: 7, createdAt: 't2' },
+      ],
+    });
+    const restored = parseLedger(legacy);
+    expect(restored).not.toBeNull();
+    expect(restored!.reservations).toEqual([]);
+    expect(restored!.records).toHaveLength(1);
+    expect(restored!.batches[0].name).toBe('旧批次');
+    // 旧字段含义不变：账面剩余仍由额定 − 已登记推导
+    expect(remainingCapacity(restored!.batches[0], restored!)).toBe(7);
+  });
+
+  it('预留结构损坏 / 挂到未知批次 / reservations 非数组时整份数据不可信', () => {
+    const badPayloads = [
+      // reservations 不是数组
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":{}}',
+      // 预留缺少金额
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":[{"id":"q1","batchId":"b1","note":"","createdAt":"t"}]}',
+      // 预留金额为小数
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":[{"id":"q1","batchId":"b1","amount":1.5,"note":"","createdAt":"t"}]}',
+      // 预留金额非正
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":[{"id":"q1","batchId":"b1","amount":0,"note":"","createdAt":"t"}]}',
+      // 预留挂在不存在的批次上
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":[{"id":"q1","batchId":"ghost","amount":1,"note":"","createdAt":"t"}]}',
+      // 预留金额超出安全整数范围
+      '{"batches":[{"id":"b1","name":"x","capacity":10,"createdAt":"t"}],"records":[],"reservations":[{"id":"q1","batchId":"b1","amount":9007199254740993,"note":"","createdAt":"t"}]}',
+    ];
     const storage = memoryStorage();
+    for (const payload of badPayloads) {
+      expect(parseLedger(payload)).toBeNull();
+      storage.setItem(LEDGER_STORAGE_KEY, payload);
+      expect(loadLedger(storage)).toEqual(EMPTY_LEDGER);
+    }
+  });
+
+  it('合法预留随台账往返：序列化 → 解析后预留集合与派生可用量一致', () => {
+    const deps = testDeps();
+    const created = createBatch(EMPTY_LEDGER, { name: '预留批次', capacity: '10' }, deps);
+    if (!created.ok) throw new Error('setup');
+    const batchId = created.value.id;
+    const reserved = reserveCapacity(created.state, { batchId, amount: '4', note: '先占' }, deps);
+    if (!reserved.ok) throw new Error('setup');
+    const recorded = recordUsage(reserved.state, { batchId, films: '3' }, deps);
+    if (!recorded.ok) throw new Error('setup');
+
+    const restored = parseLedger(serializeLedger(recorded.state));
+    expect(restored).not.toBeNull();
+    expect(restored).toEqual(recorded.state);
+    expect(restored!.reservations).toHaveLength(1);
+    expect(restored!.reservations[0].amount).toBe(4);
+    expect(restored!.reservations[0].note).toBe('先占');
+    expect(usedCapacity(restored!, batchId)).toBe(3);
+    expect(reservedCapacity(restored!, batchId)).toBe(4);
+  });
+
+  it('待写入状态无法往返校验时拒绝写入，存储中的原有台账原样保留', () => {    const storage = memoryStorage();
     const good = buildLedger();
     saveLedger(storage, good);
     const jsonBefore = storage.dump().get(LEDGER_STORAGE_KEY);
@@ -141,6 +202,7 @@ describe('容量台账持久化', () => {
         },
       ],
       records: good.records,
+      reservations: good.reservations,
     };
     expect(parseLedger(JSON.stringify(dirty))).toBeNull();
     saveLedger(storage, dirty);

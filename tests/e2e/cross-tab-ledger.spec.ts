@@ -220,7 +220,7 @@ test.describe('两个标签页交错提交同一台账', () => {
     await expect(pageB.getByTestId('detail-remaining')).toHaveText('2');
     await pageB.getByTestId('films-input').fill('8');
     await pageB.getByTestId('record-usage-button').click();
-    await expect(pageB.getByTestId('error-films')).toContainText('超过剩余容量：本批仅剩 2，无法登记 8');
+    await expect(pageB.getByTestId('error-films')).toContainText('超过可用容量：本批当前可用 2，无法登记 8');
     await expect(pageB.getByTestId('usage-item')).toHaveCount(1);
 
     const raw = await readRawLedger(pageB);
@@ -421,7 +421,7 @@ test.describe('两个标签页交错提交同一台账', () => {
     // A 在耗尽后尝试登记 1：领域拒绝
     await pageA.getByTestId('films-input').fill('1');
     await pageA.getByTestId('record-usage-button').click();
-    await expect(pageA.getByTestId('error-films')).toContainText('本批仅剩 0');
+    await expect(pageA.getByTestId('error-films')).toContainText('本批当前可用 0');
     await context.close();
   });
 

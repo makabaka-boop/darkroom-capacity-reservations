@@ -1,26 +1,26 @@
 /**
  * 药液处理容量台账的 localStorage 持久化与跨标签并发控制。
  *
- * 批次与使用记录整体存为一个 JSON 文档；读取时逐字段校验结构，
+ * 批次、使用记录与有效预留整体存为一个 JSON 文档；读取时逐字段校验结构，
  * 损坏或版本不符的数据一律视为不可信，绝不让异常进入界面。
- * 使用记录只追加不修改，因此这里也只提供整体读 / 写，不提供单条更新。
+ * 使用记录只追加不修改，预留只在结算 / 取消时整体移除，因此这里也只提供整体读 / 写。
  *
- * 批次的配液来源快照（mixSource）是可选字段：旧数据没有它，照常读取；
- * 一旦出现就必须通过结构校验，否则整份数据视为不可信。
+ * 预留（reservations）与批次的配液来源快照（mixSource）一样是后加字段：
+ * 旧存档没有它，读取时按空集合恢复；一旦出现就必须通过结构校验，否则整份数据不可信。
  *
  * 跨标签并发（本模块的核心职责）：
  * 持久化文档带一个单调递增的 revision（每次成功提交 +1）。
  * 提交动作（commitLedger）必须「先读最新文档 → 核对基准 revision →
  * 在最新台账上重放命令 → 带新 revision 原子写回」：
  * - 基准 revision 与存储不一致（其他标签已经写过）→ 拒绝本次动作，
- *   不覆盖任何记录，返回最新完整台账让当前页面对齐；
+ *   不覆盖任何记录与预留，返回最新完整台账让当前页面对齐；
  * - localStorage 写入抛错（配额 / 安全策略）→ 拒绝本次动作，
  *   存储中的最后完整台账原样保留；
- * 因此多个标签从同一旧状态交错提交时，成功的提交只会追加记录，
- * 绝不会出现「后写覆盖先写」「记录消失」「容量为负」。
+ * 因此多个标签从同一旧状态交错提交时，成功的提交只会追加记录 / 占放预留，
+ * 绝不会出现「后写覆盖先写」「记录消失」「容量为负」「结算半状态」。
  *
- * 旧版本台账（无 revision 字段）读取时按 revision 0 兼容：
- * 第一次成功提交后文档升级为带 revision 的新格式，其余字段保持不变。
+ * 旧版本台账（无 revision / 无 reservations 字段）读取时分别按
+ * revision 0 与空预留集合兼容：第一次成功提交后文档升级为新格式，其余字段保持不变。
  */
 
 import {
@@ -28,12 +28,18 @@ import {
   isMixSourceSnapshot,
   recordUsage,
   createBatch,
+  reserveCapacity,
+  settleReservation,
+  cancelReservation,
+  type CapacityReservation,
   type ChemicalBatch,
   type CommandResult,
   type CreateBatchInput,
   type LedgerDeps,
   type LedgerState,
   type RecordUsageInput,
+  type ReserveCapacityInput,
+  type SettleReservationInput,
   type UsageRecord,
 } from './capacityLedger';
 
@@ -125,6 +131,27 @@ function parseRecord(value: unknown): UsageRecord | null {
   };
 }
 
+function parseReservation(value: unknown): CapacityReservation | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    !isNonEmptyString(candidate.id) ||
+    !isNonEmptyString(candidate.batchId) ||
+    !isPositiveInteger(candidate.amount) ||
+    typeof candidate.note !== 'string' ||
+    typeof candidate.createdAt !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    id: candidate.id,
+    batchId: candidate.batchId,
+    amount: candidate.amount,
+    note: candidate.note,
+    createdAt: candidate.createdAt,
+  };
+}
+
 /**
  * 持久化文档：台账状态 + 单调递增的修订号。
  * revision 不属于领域状态（LedgerState），容量 / 记录推导与它无关。
@@ -164,7 +191,19 @@ export function parseLedger(json: string): LedgerState | null {
     if (!record || !batchIds.has(record.batchId)) return null;
     records.push(record);
   }
-  return { batches, records };
+
+  // reservations 为后加字段：旧存档没有它时按空集合恢复；
+  // 一旦携带就必须是数组，且每条预留都挂在已知批次上，否则整份数据不可信。
+  const reservations: CapacityReservation[] = [];
+  if (candidate.reservations !== undefined) {
+    if (!Array.isArray(candidate.reservations)) return null;
+    for (const item of candidate.reservations) {
+      const reservation = parseReservation(item);
+      if (!reservation || !batchIds.has(reservation.batchId)) return null;
+      reservations.push(reservation);
+    }
+  }
+  return { batches, records, reservations };
 }
 
 /** 反序列化带修订号的完整文档；缺 revision 的旧版台账按 revision 0 接受。 */
@@ -242,12 +281,18 @@ export function saveLedger(storage: StorageLike | undefined, state: LedgerState)
 /** 提交意图：在「读取时的最新台账」上重放一条领域命令。 */
 export type LedgerIntent =
   | { type: 'createBatch'; input: CreateBatchInput }
-  | { type: 'recordUsage'; input: RecordUsageInput };
+  | { type: 'recordUsage'; input: RecordUsageInput }
+  | { type: 'reserveCapacity'; input: ReserveCapacityInput }
+  | { type: 'settleReservation'; input: SettleReservationInput }
+  | { type: 'cancelReservation'; input: { reservationId: string } };
 
-/** 命令重放结果（携带命令产物，界面可据此选中新建批次等）。 */
+/** 命令重放结果（携带命令产物，界面可据此选中新建批次、清空对应表单等）。 */
 export type IntentResult =
   | { type: 'createBatch'; result: CommandResult<ChemicalBatch> }
-  | { type: 'recordUsage'; result: CommandResult<UsageRecord> };
+  | { type: 'recordUsage'; result: CommandResult<UsageRecord> }
+  | { type: 'reserveCapacity'; result: CommandResult<CapacityReservation> }
+  | { type: 'settleReservation'; result: CommandResult<UsageRecord> }
+  | { type: 'cancelReservation'; result: CommandResult<CapacityReservation> };
 
 export type CommitOutcome =
   | {
@@ -286,10 +331,19 @@ export type CommitOutcome =
     };
 
 function replayIntent(ledger: LedgerState, intent: LedgerIntent, deps: LedgerDeps): IntentResult {
-  if (intent.type === 'createBatch') {
-    return { type: 'createBatch', result: createBatch(ledger, intent.input, deps) };
+  switch (intent.type) {
+    case 'createBatch':
+      return { type: 'createBatch', result: createBatch(ledger, intent.input, deps) };
+    case 'recordUsage':
+      return { type: 'recordUsage', result: recordUsage(ledger, intent.input, deps) };
+    case 'reserveCapacity':
+      return { type: 'reserveCapacity', result: reserveCapacity(ledger, intent.input, deps) };
+    case 'settleReservation':
+      return { type: 'settleReservation', result: settleReservation(ledger, intent.input, deps) };
+    case 'cancelReservation':
+      // 取消不产生记录、不需要时间 / id：纯状态移除，复用同一套乐观并发提交。
+      return { type: 'cancelReservation', result: cancelReservation(ledger, intent.input) };
   }
-  return { type: 'recordUsage', result: recordUsage(ledger, intent.input, deps) };
 }
 
 function intentRejected(intent: IntentResult): boolean {
@@ -329,7 +383,7 @@ export function commitLedger(
     return {
       ok: false,
       kind: 'conflict',
-      error: '台账已被其他页面更新，本次登记未写入；页面已刷新为最新台账，请核对后重新登记',
+      error: '台账已被其他页面更新，本次操作未写入；页面已刷新为最新台账，请核对后重试',
       doc: latest,
     };
   }
@@ -348,7 +402,7 @@ export function commitLedger(
     return {
       ok: false,
       kind: 'storage',
-      error: '当前环境不支持本地存储，本次登记未写入',
+      error: '当前环境不支持本地存储，本次操作未写入',
       doc: latest,
     };
   }

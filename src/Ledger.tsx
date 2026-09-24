@@ -2,12 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import {
   BATCH_STATUS_LABEL,
   batchRecords,
+  batchReservations,
   batchStatus,
+  availableCapacity,
   remainingCapacity,
+  reservedCapacity,
   usedCapacity,
   validateBatchName,
   validateCapacityInput,
   validateFilmsInput,
+  validateReserveAmountInput,
+  validateSettleAmountInput,
 } from './lib/capacityLedger';
 import type { CommitOutcome, LedgerDocument, LedgerIntent } from './lib/ledgerStorage';
 
@@ -55,6 +60,15 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
   const [note, setNote] = useState('');
   const [filmsError, setFilmsError] = useState<string | null>(null);
 
+  // 预留表单（冲洗前先占容量）
+  const [reserveAmount, setReserveAmount] = useState('');
+  const [reserveNote, setReserveNote] = useState('');
+  const [reserveAmountError, setReserveAmountError] = useState<string | null>(null);
+
+  // 每条有效预留各自的结算输入（实际用量）与字段级错误，按预留 id 键控
+  const [settleAmounts, setSettleAmounts] = useState<Record<string, string>>({});
+  const [settleErrors, setSettleErrors] = useState<Record<string, string>>({});
+
   // 冲突 / 存储失败等动作级错误（不属于单个输入字段）
   const [commitError, setCommitError] = useState<string | null>(null);
   // 最近一次「失败后对齐到的修订号」：此时 revision 变化是本次失败的结果，
@@ -63,6 +77,7 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
 
   const selected = ledger.batches.find((batch) => batch.id === selectedId) ?? null;
   const selectedRecords = selected ? batchRecords(ledger, selected.id) : [];
+  const selectedReservations = selected ? batchReservations(ledger, selected.id) : [];
 
   // 外部标签页写入（storage 事件）导致文档变化时，清掉已失效的动作级提示；
   // 但要跳过「本组件一次失败提交把视图对齐到最新文档」引发的同一次变化，
@@ -80,6 +95,11 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
     setFilms('');
     setNote('');
     setFilmsError(null);
+    setReserveAmount('');
+    setReserveNote('');
+    setReserveAmountError(null);
+    setSettleAmounts({});
+    setSettleErrors({});
   }, [selectedKey]);
 
   const submitCreate = (event: React.FormEvent<HTMLFormElement>) => {
@@ -133,13 +153,105 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
     }
     if (outcome.kind === 'rejected') {
       const result = outcome.intent.result;
-      // 超过剩余容量等命令级错误同样就地说明，且不写入任何记录
+      // 超过可用容量等命令级错误同样就地说明，且不写入任何记录
       if (!result.ok) setFilmsError(result.error);
       return;
     }
     // 冲突 / 存储失败 / 损坏：本次用量未记账。
-    // 冲突时界面已随最新文档刷新（剩余量、记录列表都是最新）；
+    // 冲突时界面已随最新文档刷新（可用量、预留、记录列表都是最新）；
     // 存储失败时文档保持最后完整台账，输入保留，操作员可重试或放弃。
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
+  };
+
+  const submitReserve = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selected) return;
+    const amountErr = validateReserveAmountInput(reserveAmount);
+    setReserveAmountError(amountErr ?? null);
+    setCommitError(null);
+    if (amountErr) return;
+
+    const outcome = onCommit({
+      type: 'reserveCapacity',
+      input: { batchId: selected.id, amount: reserveAmount, note: reserveNote },
+    });
+    if (outcome.ok) {
+      setReserveAmount('');
+      setReserveNote('');
+      setReserveAmountError(null);
+      return;
+    }
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      if (!result.ok) setReserveAmountError(result.error);
+      return;
+    }
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
+  };
+
+  const submitSettle = (event: React.FormEvent<HTMLFormElement>, reservationId: string) => {
+    event.preventDefault();
+    const amount = settleAmounts[reservationId] ?? '';
+    const amountErr = validateSettleAmountInput(amount);
+    if (amountErr) {
+      setSettleErrors((prev) => ({ ...prev, [reservationId]: amountErr }));
+      return;
+    }
+    setCommitError(null);
+
+    const outcome = onCommit({
+      type: 'settleReservation',
+      input: { reservationId, films: amount },
+    });
+    if (outcome.ok) {
+      // 预留已终结：删掉它的结算草稿与错误；使用记录已原子追加
+      setSettleAmounts((prev) => {
+        const next = { ...prev };
+        delete next[reservationId];
+        return next;
+      });
+      setSettleErrors((prev) => {
+        const next = { ...prev };
+        delete next[reservationId];
+        return next;
+      });
+      return;
+    }
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      // 超预留量 / 预留已被另一页面终结：就地说明，不产生记录
+      if (!result.ok) setSettleErrors((prev) => ({ ...prev, [reservationId]: result.error }));
+      return;
+    }
+    failedAtRevision.current = outcome.doc.revision;
+    setCommitError(outcome.error);
+  };
+
+  const submitCancel = (reservationId: string) => {
+    setCommitError(null);
+    setSettleErrors((prev) => {
+      const next = { ...prev };
+      delete next[reservationId];
+      return next;
+    });
+    const outcome = onCommit({ type: 'cancelReservation', input: { reservationId } });
+    if (outcome.ok) {
+      // 取消不生成使用记录：预留整体释放，草稿一并清理
+      setSettleAmounts((prev) => {
+        const next = { ...prev };
+        delete next[reservationId];
+        return next;
+      });
+      return;
+    }
+    if (outcome.kind === 'rejected') {
+      const result = outcome.intent.result;
+      // 预留已被另一页面终结（结算 / 取消）：最新台账已不含它，提示核对即可
+      if (!result.ok) setCommitError(result.error);
+      return;
+    }
     failedAtRevision.current = outcome.doc.revision;
     setCommitError(outcome.error);
   };
@@ -244,9 +356,12 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
                       </span>
                     </span>
                     <span className="batch-item__meta">
-                      累计用量 <strong data-testid="batch-used">{usedCapacity(ledger, batch.id)}</strong>
-                      　剩余 <strong data-testid="batch-remaining">
-                        {remainingCapacity(batch, ledger)}
+                      已用 <strong data-testid="batch-used">{usedCapacity(ledger, batch.id)}</strong>
+                      　预留 <strong data-testid="batch-reserved">
+                        {reservedCapacity(ledger, batch.id)}
+                      </strong>
+                      　可用 <strong data-testid="batch-remaining">
+                        {availableCapacity(batch, ledger)}
                       </strong>
                       　额定 <span data-testid="batch-capacity">{batch.capacity}</span>
                     </span>
@@ -260,15 +375,23 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
 
       {selected && (
         <section className="panel no-print" aria-label="登记用量" data-testid="usage-panel">
-          <h2 className="panel-title">登记用量：{selected.name}</h2>
+          <h2 className="panel-title">容量台账：{selected.name}</h2>
           <dl className="summary">
             <div>
-              <dt>累计用量</dt>
+              <dt>累计已用</dt>
               <dd data-testid="detail-used">{usedCapacity(ledger, selected.id)}</dd>
             </div>
             <div>
-              <dt>剩余容量</dt>
-              <dd data-testid="detail-remaining">{remainingCapacity(selected, ledger)}</dd>
+              <dt>有效预留</dt>
+              <dd data-testid="detail-reserved">{reservedCapacity(ledger, selected.id)}</dd>
+            </div>
+            <div>
+              <dt>当前可用</dt>
+              <dd data-testid="detail-remaining">{availableCapacity(selected, ledger)}</dd>
+            </div>
+            <div>
+              <dt>账面剩余</dt>
+              <dd data-testid="detail-book-remaining">{remainingCapacity(selected, ledger)}</dd>
             </div>
             <div>
               <dt>状态</dt>
@@ -288,6 +411,126 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
             </p>
           )}
 
+          <h3 className="records-title">有效预留</h3>
+          {selectedReservations.length === 0 ? (
+            <p className="note" data-testid="reservation-empty">
+              暂无有效预留。冲洗前可先在下方占住容量，处理完成后按实际用量结算，未用部分自动释放。
+            </p>
+          ) : (
+            <ul className="reservation-list" data-testid="reservation-list">
+              {selectedReservations.map((reservation) => (
+                <li key={reservation.id} className="reservation-item" data-testid="reservation-item">
+                  <span className="reservation-item__head">
+                    <span className="reservation-item__time" data-testid="reservation-time">
+                      {formatTime(reservation.createdAt)}
+                    </span>
+                    预留 <strong data-testid="reservation-amount">{reservation.amount}</strong>（等效胶片）
+                    {reservation.note !== '' && <em data-testid="reservation-note">　备注：{reservation.note}</em>}
+                  </span>
+                  <form
+                    className="reservation-actions"
+                    onSubmit={(event) => submitSettle(event, reservation.id)}
+                    noValidate
+                  >
+                    <label htmlFor={`settle-input-${reservation.id}`}>实际使用</label>
+                    <input
+                      id={`settle-input-${reservation.id}`}
+                      data-testid="settle-input"
+                      inputMode="numeric"
+                      value={settleAmounts[reservation.id] ?? ''}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setSettleAmounts((prev) => ({ ...prev, [reservation.id]: value }));
+                        setSettleErrors((prev) => {
+                          const next = { ...prev };
+                          delete next[reservation.id];
+                          return next;
+                        });
+                      }}
+                      aria-invalid={Boolean(settleErrors[reservation.id])}
+                      aria-describedby={`settle-error-${reservation.id} settle-hint-${reservation.id}`}
+                    />
+                    <button type="submit" className="action-button" data-testid="settle-button">
+                      结算
+                    </button>
+                    <button
+                      type="button"
+                      className="action-button"
+                      data-testid="cancel-reservation-button"
+                      onClick={() => submitCancel(reservation.id)}
+                    >
+                      取消预留
+                    </button>
+                    <small id={`settle-hint-${reservation.id}`} className="hint">
+                      不超过 {reservation.amount} 的正整数；未用部分释放
+                    </small>
+                    {settleErrors[reservation.id] && (
+                      <p
+                        className="error"
+                        role="alert"
+                        id={`settle-error-${reservation.id}`}
+                        data-testid="settle-error"
+                      >
+                        {settleErrors[reservation.id]}
+                      </p>
+                    )}
+                  </form>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <form className="reserve-form" onSubmit={submitReserve} noValidate>
+            <h3 className="records-title">预留容量（冲洗前先占）</h3>
+            <div className="fields">
+              <div className={`field${reserveAmountError ? ' field--invalid' : ''}`}>
+                <label htmlFor="reserve-amount-input">预留数量（等效胶片数）</label>
+                <input
+                  id="reserve-amount-input"
+                  data-testid="reserve-amount-input"
+                  inputMode="numeric"
+                  value={reserveAmount}
+                  onChange={(event) => {
+                    setReserveAmount(event.target.value);
+                    setReserveAmountError(null);
+                  }}
+                  aria-invalid={Boolean(reserveAmountError)}
+                  aria-describedby="error-reserve-amount reserve-amount-hint"
+                />
+                <small id="reserve-amount-hint" className="hint">
+                  正整数，不得超过当前可用 {availableCapacity(selected, ledger)}
+                </small>
+                {reserveAmountError && (
+                  <p
+                    className="error"
+                    role="alert"
+                    id="error-reserve-amount"
+                    data-testid="error-reserve-amount"
+                  >
+                    {reserveAmountError}
+                  </p>
+                )}
+              </div>
+              <div className="field">
+                <label htmlFor="reserve-note-input">备注（可选）</label>
+                <input
+                  id="reserve-note-input"
+                  data-testid="reserve-note-input"
+                  value={reserveNote}
+                  onChange={(event) => setReserveNote(event.target.value)}
+                  aria-describedby="reserve-note-hint"
+                />
+                <small id="reserve-note-hint" className="hint">
+                  如：待冲 4 卷 135；结算时默认带入使用记录
+                </small>
+              </div>
+            </div>
+            <button type="submit" className="action-button" data-testid="reserve-button">
+              预留容量
+            </button>
+          </form>
+
+          <h3 className="records-title">直接登记用量</h3>
           <form onSubmit={submitUsage} noValidate>
             <div className="fields">
               <div className={`field${filmsError ? ' field--invalid' : ''}`}>
@@ -305,7 +548,7 @@ export default function Ledger({ doc, onCommit, selectedId, onSelectBatch, stora
                   aria-describedby="error-films films-hint"
                 />
                 <small id="films-hint" className="hint">
-                  正整数，不得超过剩余容量
+                  正整数，不得超过当前可用 {availableCapacity(selected, ledger)}（已扣除有效预留）
                 </small>
                 {filmsError && (
                   <p className="error" role="alert" id="error-films" data-testid="error-films">

@@ -133,12 +133,12 @@ describe('recordUsage 命令', () => {
     }
   });
 
-  it('超过剩余容量时说明原因且不写入记录', () => {
+  it('超过可用容量时说明原因且不写入记录', () => {
     const { deps, batch, state } = setup('10');
     const after4 = mustRecord(state, batch.id, '4', deps).state;
     const result = recordUsage(after4, { batchId: batch.id, films: '7' }, deps);
     expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error).toBe('超过剩余容量：本批仅剩 6，无法登记 7');
+    if (!result.ok) expect(result.error).toBe('超过可用容量：本批当前可用 6，无法登记 7');
     // 不写入：记录数与累计用量保持登记前水平
     expect(after4.records).toHaveLength(1);
     expect(usedCapacity(after4, batch.id)).toBe(4);
@@ -186,7 +186,7 @@ describe('recordUsage 命令', () => {
           state = result.state;
         } else {
           // 失败不写入，状态对象保持同一引用
-          expect(result.error).toContain('超过剩余容量');
+          expect(result.error).toContain('超过可用容量');
           expect(state).toBe(before);
         }
         expect(remainingCapacity(batch, state)).toBeGreaterThanOrEqual(0);
@@ -239,10 +239,10 @@ describe('recordUsage 命令', () => {
     expect(BATCH_STATUS_LABEL[batchStatus(batch, after10)]).toBe('已耗尽');
     expect(BATCH_STATUS_LABEL[batchStatus(batch, after4)]).toBe('使用中');
 
-    // 已耗尽后继续登记：超过剩余容量，不写入
+    // 已耗尽后继续登记：超过可用容量，不写入
     const rejected = recordUsage(after10, { batchId: batch.id, films: '1' }, deps);
     expect(rejected.ok).toBe(false);
-    if (!rejected.ok) expect(rejected.error).toBe('超过剩余容量：本批仅剩 0，无法登记 1');
+    if (!rejected.ok) expect(rejected.error).toBe('超过可用容量：本批当前可用 0，无法登记 1');
     expect(after10.records).toHaveLength(2);
   });
 

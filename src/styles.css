@@ -266,6 +266,52 @@ header h1 {
   font-style: normal;
 }
 
+.reservation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.reservation-item {
+  padding: 10px 4px;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.reservation-item:last-child {
+  border-bottom: none;
+}
+
+.reservation-item__head {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.reservation-item__time {
+  color: var(--muted);
+  font-size: 13px;
+  margin-right: 10px;
+}
+
+.reservation-item em {
+  color: var(--muted);
+  font-style: normal;
+}
+
+.reservation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.reservation-actions input {
+  width: 6em;
+}
+
+.reserve-form {
+  margin-top: 20px;
+}
+
 .panel {
   background: var(--panel);
   border: 1px solid var(--panel-border);
